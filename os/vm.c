@@ -161,7 +161,7 @@ void uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
 // create an empty user page table.
 // returns 0 if out of memory.
 pagetable_t uvmcreate()
-{
+{ 
 	pagetable_t pagetable;
 	pagetable = (pagetable_t)kalloc();
 	if (pagetable == 0) {
