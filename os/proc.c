@@ -2,6 +2,7 @@
 #include "defs.h"
 #include "loader.h"
 #include "trap.h"
+#include "timer.h"
 #include "vm.h"
 #include "queue.h"
 
@@ -32,6 +33,12 @@ void proc_init()
 		p->state = UNUSED;
 		p->kstack = (uint64)kstack[p - pool];
 		p->trapframe = (struct trapframe *)trapframe[p - pool];
+
+		memset(p->syscall_times, 0, sizeof(p->syscall_times));
+		p->start_time = 0;	
+		
+		p->stride = 0; // every process starts at stride 0
+		p->priority = DEFAULT_PRIORITY;	// default priority until changed by syscall
 	}
 	idle.kstack = (uint64)boot_stack_top;
 	idle.pid = IDLE_PID;
@@ -89,6 +96,10 @@ found:
 	memset((void *)p->trapframe, 0, TRAP_PAGE_SIZE);
 	p->context.ra = (uint64)usertrapret;
 	p->context.sp = p->kstack + KSTACK_SIZE;
+
+	p->stride = 0; // new process begins with no accumulated stride
+	p->priority = DEFAULT_PRIORITY;
+	
 	return p;
 }
 
@@ -101,27 +112,29 @@ void scheduler()
 {
 	struct proc *p;
 	for (;;) {
-		/*int has_proc = 0;
+		struct proc *next = NULL; // will hold the process we pick
+		uint64 min_stride = ~0ULL; // start with max possible value
+
+		// scan all processes to find the runnable one with smallest stride
 		for (p = pool; p < &pool[NPROC]; p++) {
 			if (p->state == RUNNABLE) {
-				has_proc = 1;
-				tracef("swtich to proc %d", p - pool);
-				p->state = RUNNING;
-				current_proc = p;
-				swtch(&idle.context, &p->context);
+				if (p->stride < min_stride) {
+					min_stride = p->stride; // track the minimum
+					next = p; // remember which process
+				}
 			}
 		}
-		if(has_proc == 0) {
-			panic("all app are over!\n");
-		}*/
-		p = fetch_task();
-		if (p == NULL) {
+
+		if (next == NULL) {
 			panic("all app are over!\n");
 		}
-		tracef("swtich to proc %d", p - pool);
-		p->state = RUNNING;
-		current_proc = p;
-		swtch(&idle.context, &p->context);
+
+		// Advance stride by pass = BIG_STRIDE / priority
+		next->stride += BIG_STRIDE / next->priority;
+		tracef("swtich to proc %d", next - pool);
+		next->state = RUNNING;
+		current_proc = next; // set global current process pointer
+		swtch(&idle.context, &next->context); // context switch into the process
 	}
 }
 
@@ -144,7 +157,6 @@ void sched()
 void yield()
 {
 	current_proc->state = RUNNABLE;
-	add_task(current_proc);
 	sched();
 }
 
@@ -184,7 +196,6 @@ int fork()
 	np->trapframe->a0 = 0;
 	np->parent = p;
 	np->state = RUNNABLE;
-	add_task(np);
 	return np->pid;
 }
 
@@ -226,7 +237,6 @@ int wait(int pid, int *code)
 			return -1;
 		}
 		p->state = RUNNABLE;
-		add_task(p);
 		sched();
 	}
 }
