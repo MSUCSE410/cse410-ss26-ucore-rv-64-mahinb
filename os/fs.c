@@ -114,6 +114,7 @@ struct inode *ialloc(uint dev, short type)
 		if (dip->type == 0) { // a free inode
 			memset(dip, 0, sizeof(*dip));
 			dip->type = type;
+			dip->nlink = 1; // new inode starts with exactly 1 link
 			bwrite(bp);
 			brelse(bp);
 			return iget(dev, inum);
@@ -135,6 +136,7 @@ void iupdate(struct inode *ip)
 	bp = bread(ip->dev, IBLOCK(ip->inum, sb));
 	dip = (struct dinode *)bp->data + ip->inum % IPB;
 	dip->type = ip->type;
+	dip->nlink = ip->nlink; // persist link count changes to disk
 	dip->size = ip->size;
 	// LAB4: you may need to update link count here
 	memmove(dip->addrs, ip->addrs, sizeof(ip->addrs));
@@ -188,13 +190,14 @@ void ivalid(struct inode *ip)
 		bp = bread(ip->dev, IBLOCK(ip->inum, sb));
 		dip = (struct dinode *)bp->data + ip->inum % IPB;
 		ip->type = dip->type;
+		ip->nlink = dip->nlink; // pull link count off disk into the in-memory inode
 		ip->size = dip->size;
 		// LAB4: You may need to get lint count here
 		memmove(ip->addrs, dip->addrs, sizeof(ip->addrs));
 		brelse(bp);
 		ip->valid = 1;
-		if (ip->type == 0)
-			panic("ivalid: no type");
+		//if (ip->type == 0)
+			//panic("ivalid: no type");
 	}
 }
 
@@ -208,7 +211,7 @@ void ivalid(struct inode *ip)
 void iput(struct inode *ip)
 {
 	// LAB4: Unmark the condition and change link count variable name (nlink) if needed
-	if (ip->ref == 1 && ip->valid && 0 /*&& ip->nlink == 0*/) {
+	if (ip->ref == 1 && ip->valid && ip->nlink == 0 && ip->type != T_DIR) {
 		// inode has no links and no other references: truncate and free.
 		itrunc(ip);
 		ip->type = 0;
@@ -428,7 +431,28 @@ int dirlink(struct inode *dp, char *name, uint inum)
 	return 0;
 }
 
-// LAB4: You may want to add dirunlink here
+// Remove the directory entry named `name` from directory inode `dp`.
+// Looks up the entry to find its byte offset within the directory file,
+// then overwrites that slot with an all-zero dirent (inum == 0 marks it
+// as free for reuse by future dirlink calls).
+// This function only removes the name-to-inum mapping — it does NOT touch
+// the target inode's nlink. The caller is responsible for decrementing
+// nlink and calling iupdate/iput to trigger deletion if appropriate.
+// Returns 0 on success, -1 if the name was not found.int dirunlink(struct inode *dp, char *name)
+{
+	uint off;
+	struct dirent de;
+	struct inode *ip;
+
+	if ((ip = dirlookup(dp, name, &off)) == 0)
+		return -1;
+	iput(ip);
+
+	memset(&de, 0, sizeof(de));
+	if (writei(dp, 0, (uint64)&de, off, sizeof(de)) != sizeof(de))
+		panic("dirunlink");
+	return 0;
+}
 
 //Return the inode of the root directory
 struct inode *root_dir()
@@ -447,8 +471,10 @@ struct inode *namei(char *path)
 	// if (path[0] == '/') {
 	//     skip = 1;
 	// }
-	struct inode *dp = root_dir();
+	struct inode *dp = root_dir(); // open root dir (ref++ on root inode)
 	if (dp == 0)
 		panic("fs dumped.\n");
-	return dirlookup(dp, path + skip, 0);
+	struct inode *ip = dirlookup(dp, path + skip, 0);
+	iput(dp);
+	return ip;
 }

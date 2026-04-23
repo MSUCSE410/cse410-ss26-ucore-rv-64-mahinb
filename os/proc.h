@@ -7,6 +7,11 @@
 #define NPROC (512)
 #define FD_BUFFER_SIZE (16)
 
+#define MAX_SYSCALL_NUM (500)
+
+#define BIG_STRIDE 0x7FFFFFFFLL   // large constant for pass calculation
+#define DEFAULT_PRIORITY 16
+
 struct file;
 
 // Saved registers for kernel context switches.
@@ -31,6 +36,20 @@ struct context {
 
 enum procstate { UNUSED, USED, SLEEPING, RUNNABLE, RUNNING, ZOMBIE };
 
+// Task status for sys_task_info
+typedef enum {
+	UnInit,
+	Ready,
+	Running,
+	Exited,
+} TaskStatus;
+
+typedef struct {
+	TaskStatus status;
+	unsigned int syscall_times[MAX_SYSCALL_NUM];
+	int time; 
+} TaskInfo;
+
 // Per-process state
 struct proc {
 	enum procstate state; // Process state
@@ -45,6 +64,13 @@ struct proc {
 	uint64 exit_code;
 	struct file *files
 		[FD_BUFFER_SIZE]; //File descriptor table, using to record the files opened by the process
+
+
+	unsigned int syscall_times[MAX_SYSCALL_NUM]; // syscall counter
+	uint64 start_time; // time when first scheduled		
+
+	uint64 stride; // current stride value
+	long long priority; // process priority (default 16)		
 };
 
 int cpuid();

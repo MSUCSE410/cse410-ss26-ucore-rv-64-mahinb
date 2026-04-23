@@ -3,8 +3,18 @@
 #include "defs.h"
 #include "loader.h"
 #include "syscall_ids.h"
+#include "proc.h"
 #include "timer.h"
 #include "trap.h"
+
+// Stat structure passed to user space
+typedef struct {
+	uint64 dev;      // device id
+	uint64 ino;      // inode number
+	uint32 mode;     // not used, set 0
+	uint32 nlink;    // number of hard links
+	uint64 pad[7];   // padding
+} Stat;
 
 uint64 console_write(uint64 va, uint64 len)
 {
@@ -144,14 +154,174 @@ uint64 sys_wait(int pid, uint64 va)
 
 uint64 sys_spawn(uint64 va)
 {
-	// TODO: your job is to complete the sys call
-	return -1;
+    struct proc *p = curr_proc();
+    char name[200];
+    copyinstr(p->pagetable, name, va, 200);
+    debugf("sys_spawn %s\n", name);
+
+    struct inode *ip = namei(name);
+    if (ip == 0)
+        return -1;
+
+    struct proc *np = allocproc();
+    if (np == 0) {
+        iput(ip);
+        return -1;
+    }
+
+    init_stdio(np);
+    bin_loader(ip, np);
+    iput(ip);
+
+    np->parent = p;
+    np->state = RUNNABLE;
+
+    char *argv[2];
+    argv[0] = name;
+    argv[1] = NULL;
+    np->trapframe->a0 = push_argv(np, argv);
+
+    return np->pid;
 }
 
 uint64 sys_set_priority(long long prio)
 {
-	// TODO: your job is to complete the sys call
-	return -1;
+    if (prio < 2) // priority must be >= 2
+        return -1;
+
+    struct proc *p = curr_proc(); // get the calling process
+    p->priority = prio; // update its priority
+    return prio;
+}
+
+static int port_to_pte(int port)
+{
+    // PTE_U is always set so the CPU allows user-mode access to these pages
+    int pte_flags = PTE_U;  // user-accessible always
+    // translate each port permission bit into its matching RISC-V PTE flag
+    if (port & 0x1) pte_flags |= PTE_R;
+    if (port & 0x2) pte_flags |= PTE_W;
+    if (port & 0x4) pte_flags |= PTE_X;
+    return pte_flags;
+}
+
+// program asks the kernel for more memory at runtime
+// kernel allocates physical pages, zeroes them out, and adds them to 
+// the process's virtual address space with the requested permissions
+uint64 sys_mmap(uint64 start, uint64 len, int port, int flag, int fd)
+{
+    // reject any invalid combinations before touching memory
+
+    // len == 0: return success immediately
+    if (len == 0)
+        return 0;
+
+    // len too big (> 1 GiB)
+    if (len > (1ULL << 30))
+        return -1;
+
+    // port high bits must all be zero
+    if (port & ~0x7)
+        return -1;
+
+    // at least one of R/W/X must be set (all-zero is meaningless)
+    if ((port & 0x7) == 0)
+        return -1;
+
+    // start must be page-aligned
+    if (start % PGSIZE != 0)
+        return -1;
+
+    // Round len up to a page boundary
+    uint64 len_aligned = PGROUNDUP(len);
+
+    struct proc *p = curr_proc();
+
+    // walk every page in the range first to make sure none are already mapped
+    for (uint64 va = start; va < start + len_aligned; va += PGSIZE) {
+        if (walkaddr(p->pagetable, va) != 0)
+            return -1;  // page already mapped
+    }
+
+    int pte_flags = port_to_pte(port);
+
+    for (uint64 va = start; va < start + len_aligned; va += PGSIZE) {
+        // Allocate one physical page
+        void *pa = kalloc();
+        if (pa == 0) {
+            // Out of memory — unmap what we already mapped and return error
+            // (pages already mapped will be freed by uvmunmap)
+            uvmunmap(p->pagetable, start, (va - start) / PGSIZE, 1);
+            return -1;
+        }
+
+        // zero the page so the process cannot see leftover data from previous use
+        memset(pa, 0, PGSIZE);
+
+        // Map VA → PA in the user page table
+        if (mappages(p->pagetable, va, PGSIZE, (uint64)pa, pte_flags) != 0) {
+            kfree(pa);
+            uvmunmap(p->pagetable, start, (va - start) / PGSIZE, 1);
+            return -1;
+        }
+    }
+
+    return 0;
+}
+
+// kernel removes the virtual address mappings and frees the 
+// physical pages back to the free list so other processes can use them
+// opposite of mmap
+uint64 sys_munmap(uint64 start, uint64 len)
+{
+    if (len == 0)
+        return 0;
+
+    // start must be page-aligned
+    if (start % PGSIZE != 0)
+        return -1;
+
+    uint64 len_aligned = PGROUNDUP(len);
+
+    struct proc *p = curr_proc();
+
+    // Check every page in [start, start+len) is mapped
+    for (uint64 va = start; va < start + len_aligned; va += PGSIZE) {
+        if (walkaddr(p->pagetable, va) == 0)
+            return -1;  // unmapped page found in range
+    }
+
+    // unmap and free the physical memory for every page in the range
+    uvmunmap(p->pagetable, start, len_aligned / PGSIZE, 1);
+
+    return 0;
+}
+/*
+* LAB1: you may need to define sys_task_info here
+*/
+// how long kernel has been running and how many times it has called each syscall
+uint64 sys_task_info(uint64 ti_va)
+{
+    struct proc *p = curr_proc();
+
+    // Translate user VA → physical address
+    uint64 pa = useraddr(p->pagetable, ti_va);
+    if (pa == 0)
+        return -1;
+
+    // Write directly through the physical address
+    TaskInfo *kti = (TaskInfo *)pa;
+    kti->status = Running;
+
+    // copy the syscall counter array that has been tracking calls since the process started
+    for (int i = 0; i < MAX_SYSCALL_NUM; i++)
+        kti->syscall_times[i] = p->syscall_times[i];
+
+    // subtract start_time from current cycle count and convert to milliseconds
+    uint64 elapsed = get_cycle() - p->start_time;
+    kti->time = (int)(elapsed * 1000 / CPU_FREQ);
+
+    return 0;
 }
 
 uint64 sys_openat(uint64 va, uint64 omode, uint64 _flags)
@@ -177,19 +347,120 @@ uint64 sys_close(int fd)
 	return 0;
 }
 
-int sys_fstat(int fd,uint64 stat){
-	//TODO: your job is to complete the syscall
-	return -1;
+// Implements the fstat syscall (ID 80).
+// Given an open file descriptor, fills a user-space Stat struct with
+// metadata about the underlying inode: device number, inode number,
+// file type (translated to the user-space mode bitmask), and the
+// current hard link count. Returns -1 on invalid fd or copy failure,
+// 0 on success.
+#define STAT_FILE 0x100000
+#define STAT_DIR  0x040000
+
+int sys_fstat(int fd, uint64 stat)
+{
+    struct proc *p = curr_proc();
+    if (fd < 0 || fd >= FD_BUFFER_SIZE)
+        return -1;
+    struct file *f = p->files[fd];
+    if (f == NULL || f->type != FD_INODE)
+        return -1;
+
+    struct inode *ip = f->ip;
+    ivalid(ip);
+
+    Stat st;
+    memset(&st, 0, sizeof(st));
+    st.dev = ip->dev;
+    st.ino = ip->inum;
+    st.mode = (ip->type == T_DIR) ? STAT_DIR : STAT_FILE;
+    st.nlink = ip->nlink;
+
+    if (copyout(p->pagetable, stat, (char *)&st, sizeof(st)) < 0)
+        return -1;
+    return 0;
 }
 
-int sys_linkat(int olddirfd, uint64 oldpath, int newdirfd, uint64 newpath, uint64 flags){
-	//TODO: your job is to complete the syscall
-	return -1;
+// Implements the linkat syscall (ID 37).
+// Creates a new hard link: adds a second directory entry (newpath) in the
+// root directory that points to the same inode as oldpath. Increments the
+// inode's nlink so the file persists until all links are removed.
+// Only works on regular files (not directories). If the new name already
+// exists or matches the old name, returns -1. On dirlink failure, rolls
+// back the nlink increment to avoid a phantom link count.
+// olddirfd, newdirfd, and flags are ignored per the lab spec.
+int sys_linkat(int olddirfd, uint64 oldpath, int newdirfd, uint64 newpath, uint64 flags)
+{
+	struct proc *p = curr_proc();
+	char old[MAXPATH], new[MAXPATH];
+
+	copyinstr(p->pagetable, old, oldpath, MAXPATH);
+	copyinstr(p->pagetable, new, newpath, MAXPATH);
+
+	// linking to the same name is an error
+	if (strncmp(old, new, MAXPATH) == 0)
+		return -1;
+
+	struct inode *ip = namei(old);
+	if (ip == 0)
+		return -1;
+
+	ivalid(ip);
+
+	// only link regular files
+	if (ip->type != T_FILE) {
+		iput(ip);
+		return -1;
+	}
+
+	ip->nlink++;
+	iupdate(ip);
+
+	struct inode *dp = root_dir();
+	if (dirlink(dp, new, ip->inum) < 0) {
+		ip->nlink--;
+		iupdate(ip);
+		iput(ip);
+		iput(dp);
+		return -1;
+	}
+
+	iput(dp);
+	iput(ip);
+	return 0;
 }
 
-int sys_unlinkat(int dirfd, uint64 name, uint64 flags){
-	//TODO: your job is to complete the syscall
-	return -1;
+// Implements the unlinkat syscall (ID 35).
+// Removes a hard link by deleting the directory entry for the given path
+// from the root directory and decrementing the inode's nlink count.
+// When nlink reaches 0, the final iput call will detect that no links
+// remain and no other references exist, then truncate all data blocks
+// and mark the inode as free on disk — effectively deleting the file.
+// dirfd and flags are ignored per the lab spec.
+// Returns -1 if the file doesn't exist, 0 on success.
+int sys_unlinkat(int dirfd, uint64 name, uint64 flags)
+{
+	struct proc *p = curr_proc();
+	char path[MAXPATH];
+	copyinstr(p->pagetable, path, name, MAXPATH);
+
+	struct inode *ip = namei(path);
+	if (ip == 0)
+		return -1;
+
+	ivalid(ip);
+
+	struct inode *dp = root_dir();
+	if (dirunlink(dp, path) < 0) {
+		iput(dp);
+		iput(ip);
+		return -1;
+	}
+
+	ip->nlink--;
+	iupdate(ip);
+	iput(dp);
+	iput(ip);   // if nlink == 0, iput will truncate and free
+	return 0;
 }
 
 extern char trap_page[];
@@ -202,6 +473,10 @@ void syscall()
 			   trapframe->a3, trapframe->a4, trapframe->a5 };
 	tracef("syscall %d args = [%x, %x, %x, %x, %x, %x]", id, args[0],
 	       args[1], args[2], args[3], args[4], args[5]);
+
+	if (id >= 0 && id < MAX_SYSCALL_NUM) {
+		curr_proc()->syscall_times[id]++;
+	}		  		   
 	switch (id) {
 	case SYS_write:
 		ret = sys_write(args[0], args[1], args[2]);
@@ -247,9 +522,23 @@ void syscall()
 		break;
 	case SYS_unlinkat:
 	    ret = sys_unlinkat(args[0],args[1],args[2]);
+		break;
 	case SYS_spawn:
 		ret = sys_spawn(args[0]);
 		break;
+		
+	case SYS_task_info:
+		ret = sys_task_info(args[0]);
+		break;
+	case SYS_mmap:
+    	ret = sys_mmap(args[0], args[1], (int)args[2], (int)args[3], (int)args[4]);
+    	break;
+	case SYS_munmap:
+    	ret = sys_munmap(args[0], args[1]);
+    	break;		
+	case SYS_setpriority:
+		ret = sys_set_priority(args[0]);
+		break;		
 	default:
 		ret = -1;
 		errorf("unknown syscall %d", id);
