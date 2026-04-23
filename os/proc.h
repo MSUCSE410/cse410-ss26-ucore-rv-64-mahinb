@@ -66,6 +66,14 @@ struct proc {
 	// LAB5: (1) Define your variables for deadlock detect here.
 	//			 You may need a flag to record if detection enabled,
 	//       and some arrays for detection algorithm.
+	int deadlock_detect_enabled;
+	// For Banker's algorithm:
+	// available[i] = how many instances of lock i are available
+	int available[LOCK_POOL_SIZE];
+	// allocation[tid][i] = how many instances of lock i thread tid holds
+	int allocation[NTHREAD][LOCK_POOL_SIZE];
+	// request[tid][i] = how many instances of lock i thread tid is requesting
+	int request[NTHREAD][LOCK_POOL_SIZE];
 };
 
 int cpuid();

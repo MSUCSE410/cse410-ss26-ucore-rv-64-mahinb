@@ -143,6 +143,17 @@ found:
 	p->next_semaphore_id = 0;
 	p->next_condvar_id = 0;
 	// LAB5: (1) you may initialize your new proc variables here
+	// detection starts disabled; userspace must explicitly call sys_enable_deadlock_detect(1)
+	p->deadlock_detect_enabled = 0;
+
+	// no locks have been created yet so nothing is available
+	memset(p->available, 0, sizeof(p->available));
+
+	// no thread holds any lock yet
+	memset(p->allocation, 0, sizeof(p->allocation));
+
+	// no thread is waiting on any lock yet
+	memset(p->request, 0, sizeof(p->request));	
 	return p;
 }
 
