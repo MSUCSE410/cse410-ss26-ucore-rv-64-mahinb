@@ -67,13 +67,19 @@ struct proc {
 	//			 You may need a flag to record if detection enabled,
 	//       and some arrays for detection algorithm.
 	int deadlock_detect_enabled;
-	// For Banker's algorithm:
+
+	// separate available/allocation/request for mutexes
 	// available[i] = how many instances of lock i are available
-	int available[LOCK_POOL_SIZE];
 	// allocation[tid][i] = how many instances of lock i thread tid holds
-	int allocation[NTHREAD][LOCK_POOL_SIZE];
 	// request[tid][i] = how many instances of lock i thread tid is requesting
-	int request[NTHREAD][LOCK_POOL_SIZE];
+	int mutex_available[LOCK_POOL_SIZE];
+	int mutex_allocation[NTHREAD][LOCK_POOL_SIZE];
+	int mutex_request[NTHREAD][LOCK_POOL_SIZE];
+
+	// separate available/allocation/request for semaphores
+	int sem_available[LOCK_POOL_SIZE];
+	int sem_allocation[NTHREAD][LOCK_POOL_SIZE];
+	int sem_request[NTHREAD][LOCK_POOL_SIZE];
 };
 
 int cpuid();

@@ -279,19 +279,29 @@ int deadlock_detect(const int available[LOCK_POOL_SIZE],
 			continue;
 		}
 
-		// a thread that holds no locks at all cannot block anyone else,
-		// so it can always finish without needing additional resources
-		int holds_nothing = 1;
+		// only skip threads that are completely uninvolved:
+		// not requesting anything AND not holding anything
+		// a thread requesting its first lock holds nothing but must NOT
+		// be skipped — it is actively waiting and must be checked
+		int requesting_something = 0;
 		for (int j = 0; j < LOCK_POOL_SIZE; j++) {
-			if (allocation[i][j] > 0) {
-				holds_nothing = 0; // found a held resource — thread is relevant
+			if (request[i][j] > 0) {
+				requesting_something = 1; // this thread is waiting
 				break;
 			}
 		}
-		// mark it done now so the main loop below does not waste time on it
-		if (holds_nothing)
+		int holds_something = 0;
+		for (int j = 0; j < LOCK_POOL_SIZE; j++) {
+			if (allocation[i][j] > 0) {
+				holds_something = 1; // this thread holds a resource
+				break;
+			}
+		}
+		// mark as finished only if completely uninvolved in any locking
+		if (!requesting_something && !holds_something)
 			finish[i] = 1;
 	}
+
 
 	// repeatedly scan threads until no more progress can be made
 	// progress = 1 means at least one thread was unblocked this pass
@@ -344,7 +354,7 @@ int sys_mutex_create(int blocking)
 	// LAB5: (4-1) You may want to maintain some variables for detect here
 	int mutex_id = m - curr_proc()->mutex_pool;
 	// a freshly created mutex is unlocked, so exactly 1 instance is available
-	curr_proc()->available[mutex_id] = 1;
+	curr_proc()->mutex_available[mutex_id] = 1;
 
 	debugf("create mutex %d", mutex_id);
 	return mutex_id;
@@ -362,15 +372,15 @@ int sys_mutex_lock(int mutex_id)
 
 	if (p->deadlock_detect_enabled) {
 		// mark that this thread is now requesting mutex_id
-		p->request[tid][mutex_id] = 1;
+		p->mutex_request[tid][mutex_id] = 1;
 
 		// run Banker's algorithm; if granting this would cause deadlock, refuse
-		if (deadlock_detect(p->available, p->allocation, p->request)) {
+		if (deadlock_detect(p->mutex_available, p->mutex_allocation, p->mutex_request)) {
 			// undo the request mark — we are not actually going to block
-			p->request[tid][mutex_id] = 0;
+			p->mutex_request[tid][mutex_id] = 0;
 			errorf("deadlock detected on mutex_lock %d by tid %d",
 			       mutex_id, tid);
-			return -1; // signal failure to the caller
+			return -0xdead; // signal failure to the caller
 		}
 	}
 
@@ -379,9 +389,9 @@ int sys_mutex_lock(int mutex_id)
 
 	// LAB5: (4-1) mutex acquired — update the tracking tables
 	if (p->deadlock_detect_enabled) {
-		p->available[mutex_id]--;       // one fewer free instance of this mutex
-		p->allocation[tid][mutex_id]++; // this thread now holds one instance
-		p->request[tid][mutex_id] = 0; // request fulfilled, clear the flag
+		p->mutex_available[mutex_id]--;       // one fewer free instance of this mutex
+		p->mutex_allocation[tid][mutex_id]++; // this thread now holds one instance
+		p->mutex_request[tid][mutex_id] = 0; // request fulfilled, clear the flag
 	}
 	return 0;
 }
@@ -397,8 +407,10 @@ int sys_mutex_unlock(int mutex_id)
 	int tid = curr_thread()->tid; // the thread releasing this mutex
 
 	if (p->deadlock_detect_enabled) {
-		p->available[mutex_id]++;       // this mutex is free again
-		p->allocation[tid][mutex_id]--; // this thread no longer holds it
+		p->mutex_available[mutex_id]++;       // this mutex is free again
+		// only decrement if this thread actually holds it
+		if (p->mutex_allocation[tid][mutex_id] > 0)
+			p->mutex_allocation[tid][mutex_id]--;
 	}
 
 	// release the mutex so a waiting thread can acquire it
@@ -418,7 +430,7 @@ int sys_semaphore_create(int res_count)
 
 	// initialize available to the semaphore's starting permit count
 	// unlike a mutex (always 1), a semaphore can begin with N permits
-	curr_proc()->available[sem_id] = res_count;
+	curr_proc()->sem_available[sem_id] = res_count;
 
 	debugf("create semaphore %d", sem_id);
 	return sem_id;
@@ -436,8 +448,11 @@ int sys_semaphore_up(int semaphore_id)
 	int tid = curr_thread()->tid; // the thread releasing a permit
 
 	if (p->deadlock_detect_enabled) {
-		p->available[semaphore_id]++;       // one more free permit
-		p->allocation[tid][semaphore_id]--; // this thread gives up one permit
+		p->sem_available[semaphore_id]++;       // one more free permit
+		// only decrement if this thread actually holds a permit;
+		// main thread may call semaphore_up without having called down first
+		if (p->sem_allocation[tid][semaphore_id] > 0)
+			p->sem_allocation[tid][semaphore_id]--;
 	}
 
 	// signal the semaphore so a waiting thread can wake up
@@ -458,15 +473,15 @@ int sys_semaphore_down(int semaphore_id)
 
 	if (p->deadlock_detect_enabled) {
 		// mark that this thread is now requesting one permit of semaphore_id
-		p->request[tid][semaphore_id] = 1;
+		p->sem_request[tid][semaphore_id] = 1;
 
 		// run Banker's algorithm; refuse if granting this would deadlock
-		if (deadlock_detect(p->available, p->allocation, p->request)) {
+		if (deadlock_detect(p->sem_available, p->sem_allocation, p->sem_request)) {
 			// undo the request mark — we are not going to block
-			p->request[tid][semaphore_id] = 0;
+			p->sem_request[tid][semaphore_id] = 0;
 			errorf("deadlock detected on semaphore_down %d by tid %d",
 			       semaphore_id, tid);
-			return -1; // signal failure to the caller
+			return -0xdead; // signal failure to the caller
 		}
 	}
 
@@ -475,9 +490,9 @@ int sys_semaphore_down(int semaphore_id)
 
 	// LAB5: (4-2) permit granted — update the tracking tables
 	if (p->deadlock_detect_enabled) {
-		p->available[semaphore_id]--;       // one fewer free permit
-		p->allocation[tid][semaphore_id]++; // this thread now holds one permit
-		p->request[tid][semaphore_id] = 0; // request fulfilled, clear the flag
+		p->sem_available[semaphore_id]--;       // one fewer free permit
+		p->sem_allocation[tid][semaphore_id]++; // this thread now holds one permit
+		p->sem_request[tid][semaphore_id] = 0; // request fulfilled, clear the flag
 	}
 	return 0;
 }

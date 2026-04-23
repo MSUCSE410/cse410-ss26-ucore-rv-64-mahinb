@@ -147,13 +147,14 @@ found:
 	p->deadlock_detect_enabled = 0;
 
 	// no locks have been created yet so nothing is available
-	memset(p->available, 0, sizeof(p->available));
-
 	// no thread holds any lock yet
-	memset(p->allocation, 0, sizeof(p->allocation));
-
 	// no thread is waiting on any lock yet
-	memset(p->request, 0, sizeof(p->request));	
+	memset(p->mutex_available, 0, sizeof(p->mutex_available));
+	memset(p->mutex_allocation, 0, sizeof(p->mutex_allocation));
+	memset(p->mutex_request, 0, sizeof(p->mutex_request));
+	memset(p->sem_available, 0, sizeof(p->sem_available));
+	memset(p->sem_allocation, 0, sizeof(p->sem_allocation));
+	memset(p->sem_request, 0, sizeof(p->sem_request));
 	return p;
 }
 
