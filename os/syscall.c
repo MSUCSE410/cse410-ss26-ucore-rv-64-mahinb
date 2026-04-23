@@ -353,30 +353,42 @@ uint64 sys_close(int fd)
 // file type (translated to the user-space mode bitmask), and the
 // current hard link count. Returns -1 on invalid fd or copy failure,
 // 0 on success.
-#define STAT_FILE 0x100000
-#define STAT_DIR  0x040000
+#define STAT_FILE 0x100000 // user-space mode constant for regular files
+#define STAT_DIR  0x040000 // user-space mode constant for directories
 
 int sys_fstat(int fd, uint64 stat)
 {
-    struct proc *p = curr_proc();
+    struct proc *p = curr_proc();  // get the calling process
+
+    // validate that fd is within the legal range of the process's fd table
     if (fd < 0 || fd >= FD_BUFFER_SIZE)
         return -1;
-    struct file *f = p->files[fd];
+
+    struct file *f = p->files[fd];  // look up the open file struct for this fd
+
+    // fd must be open and must point to an on-disk inode (not stdio)
     if (f == NULL || f->type != FD_INODE)
         return -1;
 
-    struct inode *ip = f->ip;
-    ivalid(ip);
+    struct inode *ip = f->ip;  // get the inode that this file refers to
+    ivalid(ip);                // make sure type, nlink, size are loaded from disk
 
+    // build the stat struct in kernel memory before copying to user space
     Stat st;
-    memset(&st, 0, sizeof(st));
-    st.dev = ip->dev;
-    st.ino = ip->inum;
-    st.mode = (ip->type == T_DIR) ? STAT_DIR : STAT_FILE;
-    st.nlink = ip->nlink;
+    memset(&st, 0, sizeof(st));  // zero out the entire struct including pad[]
 
+    st.dev = ip->dev;    // device number this inode lives on
+    st.ino = ip->inum;   // inode number on disk
+
+    // translate the on-disk type (T_FILE=2, T_DIR=1) to the user-space
+    // mode bitmask that the test program expects (FILE=0x100000, DIR=0x040000)
+    st.mode = (ip->type == T_DIR) ? STAT_DIR : STAT_FILE;
+
+    st.nlink = ip->nlink;  // current number of hard links pointing at this inode
+
+    // copy the filled-in struct from kernel memory into the user's buffer
     if (copyout(p->pagetable, stat, (char *)&st, sizeof(st)) < 0)
-        return -1;
+        return -1;  // user provided an invalid address
     return 0;
 }
 
@@ -390,42 +402,49 @@ int sys_fstat(int fd, uint64 stat)
 // olddirfd, newdirfd, and flags are ignored per the lab spec.
 int sys_linkat(int olddirfd, uint64 oldpath, int newdirfd, uint64 newpath, uint64 flags)
 {
-	struct proc *p = curr_proc();
+	struct proc *p = curr_proc();  // get the calling process
 	char old[MAXPATH], new[MAXPATH];
 
+	// copy both path strings from user space into kernel buffers
 	copyinstr(p->pagetable, old, oldpath, MAXPATH);
 	copyinstr(p->pagetable, new, newpath, MAXPATH);
 
-	// linking to the same name is an error
+	// can't create a link with the same name as the original —
+	// that entry already exists in the directory
 	if (strncmp(old, new, MAXPATH) == 0)
 		return -1;
 
+	// look up the inode for the original file
 	struct inode *ip = namei(old);
 	if (ip == 0)
-		return -1;
+		return -1;  // original file doesn't exist
 
-	ivalid(ip);
+	ivalid(ip);  // load type and nlink from disk into memory
 
-	// only link regular files
+	// hard links to directories are not allowed — only regular files
 	if (ip->type != T_FILE) {
-		iput(ip);
+		iput(ip);  // release the ref we got from namei
 		return -1;
 	}
 
+	// increment the link count first and write to disk, so the inode
+	// reflects the new link even if we crash between here and dirlink
 	ip->nlink++;
-	iupdate(ip);
+	iupdate(ip);  // persist the incremented nlink to disk
 
+	// open the root directory and add a new entry mapping newpath -> same inum
 	struct inode *dp = root_dir();
 	if (dirlink(dp, new, ip->inum) < 0) {
-		ip->nlink--;
-		iupdate(ip);
-		iput(ip);
-		iput(dp);
+		// dirlink failed (e.g. name already exists) — roll back
+		ip->nlink--;   // undo the nlink bump
+		iupdate(ip);   // persist the rollback to disk
+		iput(ip);      // release file inode ref
+		iput(dp);      // release root dir ref
 		return -1;
 	}
 
-	iput(dp);
-	iput(ip);
+	iput(dp);  // release root directory reference
+	iput(ip);  // release file inode reference (nlink >= 2 now, so it won't be freed)
 	return 0;
 }
 
@@ -439,30 +458,41 @@ int sys_linkat(int olddirfd, uint64 oldpath, int newdirfd, uint64 newpath, uint6
 // Returns -1 if the file doesn't exist, 0 on success.
 int sys_unlinkat(int dirfd, uint64 name, uint64 flags)
 {
-	struct proc *p = curr_proc();
+	struct proc *p = curr_proc();  // get the calling process
 	char path[MAXPATH];
+
+	// copy the filename from user space into a kernel buffer
 	copyinstr(p->pagetable, path, name, MAXPATH);
 
+	// look up the inode for the file being unlinked
 	struct inode *ip = namei(path);
 	if (ip == 0)
-		return -1;
+		return -1;  // file doesn't exist
 
-	ivalid(ip);
+	ivalid(ip);  // load type, nlink, size from disk so we can modify nlink
 
+	// open the root directory to remove the directory entry
 	struct inode *dp = root_dir();
+
+	// erase the directory entry (zero out its dirent slot)
 	if (dirunlink(dp, path) < 0) {
-		iput(dp);
-		iput(ip);
-		return -1;
+		iput(dp);  // release root dir ref
+		iput(ip);  // release file inode ref
+		return -1; // shouldn't normally fail since namei already found it
 	}
 
+	// decrement the link count now that one fewer name points to this inode
 	ip->nlink--;
-	iupdate(ip);
-	iput(dp);
-	iput(ip);   // if nlink == 0, iput will truncate and free
+	iupdate(ip);  // write the decremented nlink to disk
+
+	iput(dp);  // release root directory reference
+
+	// release file inode reference — if nlink just hit 0 and this is the
+	// last ref (ref == 1 before decrement), iput will call itrunc to free
+	// all data blocks and mark the on-disk inode as free (type = 0)
+	iput(ip);
 	return 0;
 }
-
 extern char trap_page[];
 
 void syscall()
