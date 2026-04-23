@@ -438,7 +438,8 @@ int dirlink(struct inode *dp, char *name, uint inum)
 // This function only removes the name-to-inum mapping — it does NOT touch
 // the target inode's nlink. The caller is responsible for decrementing
 // nlink and calling iupdate/iput to trigger deletion if appropriate.
-// Returns 0 on success, -1 if the name was not found.int dirunlink(struct inode *dp, char *name)
+// Returns 0 on success, -1 if the name was not found.
+int dirunlink(struct inode *dp, char *name)
 {
 	uint off;
 	struct dirent de;
